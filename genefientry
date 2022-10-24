@@ -32,7 +32,7 @@
 DEFAULT_KERNEL_PARAMS="quiet loglevel=3"
 # if you have a swap partition, you can add the resume flags here like this example below
 # also specify any other params that you want to be added to the kernel parameter every time
-DEFAULT_KERNEL_PARAMS="resume=PARTUUID=87a8927c-2c49-4c96-949b-63d2aaef6a08 intel_pstate=disable quiet loglevel=3"
+#DEFAULT_KERNEL_PARAMS="resume=PARTUUID=87a8927c-2c49-4c96-949b-63d2aaef6a08 intel_pstate=disable quiet loglevel=3"
 # name of microcode image to look for inside /boot
 MICROCODE="intel-uc.img"
 ################################################################
