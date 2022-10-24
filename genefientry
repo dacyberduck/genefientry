@@ -1,0 +1,300 @@
+#!/bin/bash
+
+################################################################
+# small & simple shell script to create automatic efi boot entry
+# using efibootmgr without the need of typing those long params.
+# the script copies the kernel image inside the ESP directory
+# renaming it as vmlinuz-<kernel-version>.efi and then creates
+# a new boot entry using efibootmgr.
+# it automatically detects your root PARTUUID and rootflags,
+# detects initramfs and microcode(if defined in configuration)
+# and thereby copies those to ESP. however the initramfs and
+# microcode files has to be reside inside /boot directory.
+#
+# see the DEFAULT CONFIGURATION section below.
+#
+### requirements:
+#  > efibootmgr, findmnt, grep, awk etc
+#  > EFISTUB support in the kernel
+#
+### limitations:
+#   > never tested on lvm/raid system and probably won't work
+#   > same with zfs. tell me if it works
+#   > rootflags are obtained using 'findmnt' command
+#   > doesn't detect swap automatically. specify the resume
+#     flags in DEFAULT_KERNEL_PARAMETERS or you can pass those
+#     with the -u option.
+#   > driver support
+################################################################
+
+################## DEFAULT CONFIGURATION #######################
+# default kernel parameters to be appended; edit accordingly
+DEFAULT_KERNEL_PARAMS="quiet loglevel=3"
+# if you have a swap partition, you can add the resume flags here like this example below
+# also specify any other params that you want to be added to the kernel parameter every time
+DEFAULT_KERNEL_PARAMS="resume=PARTUUID=87a8927c-2c49-4c96-949b-63d2aaef6a08 intel_pstate=disable quiet loglevel=3"
+# name of microcode image to look for inside /boot
+MICROCODE="intel-uc.img"
+################################################################
+
+### colored msgs
+log()  { printf "\033[0m\n%s" "${1}"; }
+info() { printf "\033[0;32m%s\033[0m" "${1}"; }
+warn() { printf "\033[1;33mWarning: %s\033[0m" "${1}"; }
+err()  { printf "\033[0;31mError: %s\033[0m\n" "${1}"; exit "${2:-1}"; }
+
+# help msg
+help() {
+  cat <<EOF
+
+    USAGE: genefientry -d /dev/sdb -p 1
+
+           -d,--efi-drive             efi drive name               Ex. - For efi partition /dev/sdb1 -> /dev/sdb
+           -k,--kernel-ver            kernel version               Default: /usr/src/linux
+           -l,--boot-label            name of the new boot entry   Default: 'NAME' in /etc/os-release
+           -m,--microcode             microcode image file name    Ex. - 'intel-ucode.img' (must be in /boot dir)
+           -p,--efi-part-no           efi partition number         Ex. - For efi partition /dev/sdb1 -> 1
+           -r,--root-flags            root flags
+           -u,--kernel-parameters     kernel parameters            Default: 'quiet loglevel=3'
+           -h,--help                  print help menu
+
+EOF
+}
+
+[[ $# -lt 1 ]] && help && exit 1
+
+while [[ $# -gt 0 ]]; do
+  case "${1}" in
+    -d|--efi-drive)
+      EFI_DRIVE=${2}
+      shift
+      ;;
+    -k|--kernel-ver)
+      KVER=${2}
+      shift
+      ;;
+    -l|--boot-label)
+      LABEL=${2}
+      shift
+      ;;
+    -m|--microcode)
+      MICROCODE="${2}"
+      # check if the microcode exists or not
+      test -f "/boot/${MICROCODE}" || err "microcode image '${MICROCODE}' is not present inside /boot"
+      shift
+      ;;
+    -p|--efi-part-no)
+      ESP_PARTN="${2}"
+      shift
+      ;;
+    -r|--root-flags)
+      ROOTFLAGS="${2}"
+      shift
+      ;;
+    -u|--kernel-parameters)
+      KPARAMS="${2}"
+      shift
+      ;;
+    -h|--help)
+      help
+      exit 0
+      ;;
+    *)
+      help
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+# check required parameters
+[[ -z ${EFI_DRIVE} ]] && err "efi drive name not specified. try 'genefientry -h'"
+[[ -z ${ESP_PARTN} ]] && err "efi partition number not specified. try 'genefientry -h'"
+
+# check if esp is mounted
+printf "checking if esp is mounted... "
+efimntpnt=$(findmnt -n -o TARGET "${EFI_DRIVE}${ESP_PARTN}")
+if [[ -z ${efimntpnt} ]] ; then
+  err "mount efi partition first"
+else
+  info "$EFI_DRIVE$ESP_PARTN -> ${efimntpnt}"
+fi
+
+# take care of kernel and initramfs
+# use /usr/src/linux as default if not specified
+log "checking kernel version... "
+if [[ -z ${KVER} ]]; then
+  KVER=$(readlink /usr/src/linux 2>/dev/null)
+  KVER=${KVER#linux-}
+fi
+if [[ -z ${KVER} ]]; then
+  err "failed to determine kernel version"
+else
+  info "${KVER}"
+fi
+
+# use default label if not given
+log "checking if label is valid... "
+if [[ -z ${LABEL} ]]; then
+  LABEL="$(grep ^NAME /etc/os-release | awk -F "=" '{print $2}') (${KVER})"
+fi
+if [[ -z ${LABEL} ]]; then
+  err "failed to obtain boot label"
+else
+  info "${LABEL}"
+fi
+
+# check if kernel image exists
+log "checking if kernel image exists... "
+kimage= # store kernel image path
+# if kernel image is available in /boot
+if test -f /boot/vmlinuz-"${KVER}"; then
+  kimage=/boot/vmlinuz-"${KVER}"
+# if it is available in /usr/src/linux-<kernel-ver>/arch/<arch>/boot
+# not sure if this is okay since the image can be a symlink as well
+elif test -f /usr/src/linux-"${KVER}"/arch/"$(arch)"/boot/bzImage ; then
+  kimage=/usr/src/linux-${KVER}/arch/$(arch)/boot/bzImage
+fi
+if [[ -z ${kimage} ]]; then
+  err "kernel image can not be found"
+else
+  info "${kimage}"
+fi
+
+# find root partuuid, rootfstype and rootflags
+log "checking root partition PARTUUID... "
+root_partuuid=$(findmnt -n -o PARTUUID / 2>/dev/null)
+if [[ -z ${root_partuuid} ]]; then
+  err "root partition is not mounted or something went wrong!!!"
+else
+  info "${root_partuuid}"
+fi
+log "checking root filesystem type... "
+root_fstype=$(findmnt -n -o FSTYPE / 2>/dev/null)
+if [[ -z ${root_fstype} ]]; then
+  err "can't determine root file system type"
+else
+  info "${root_fstype}"
+fi
+log "checking the root flags... "
+if [[ -z ${ROOTFLAGS} ]]; then
+  root_flags=$(findmnt -n -o OPTIONS / 2>/dev/null)
+  info "${root_flags}"
+  log # next line
+  warn "if the default root flags don't work, specify root flags manually using '-r' option"
+else
+  root_flags="${ROOTFLAGS}"
+  info "${root_flags}"
+fi
+
+# check if microcode exists
+log "checking if microcode exists... "
+if test -f /boot/"${MICROCODE}" ; then
+  IS_MICROCODE="yes"
+  INITRD="initrd=\\${MICROCODE}"
+  info "/boot/${MICROCODE}"
+else
+  err "not found"
+fi
+
+# check if initramfs exists
+log "checking if initramfs exists... "
+if test -f /boot/initramfs-"${KVER}".img ; then
+  IS_INITRAMFS="yes"
+  INITRD="${INITRD} initrd=\\initramfs-${KVER}.img"
+  info "/boot/initramfs-${KVER}.img"
+else
+  err "not found"
+fi
+
+### preview command and ask for confirmation
+log "showing preview of the final command... "
+printf "\n\n"
+info "  efibootmgr --quiet --create \\"
+printf "\n"
+info "             --disk ${EFI_DRIVE} --part ${ESP_PARTN} \\"
+printf "\n"
+info "             --label '${LABEL}' \\"
+printf "\n"
+info "             --loader '\\vmlinuz-$KVER.efi' \\"
+printf "\n"
+info "             --unicode 'root=PARTUUID=${root_partuuid} rootfstype=${root_fstype} \\"
+printf "\n"
+info "                        rootflags=${root_flags} rw \\"
+printf "\n"
+info "                        ${DEFAULT_KERNEL_PARAMS} ${KPARAMS} \\"
+printf "\n"
+info "                        ${INITRD}'"
+printf "\n\n"
+
+### ask for confirmation
+warn "Do you really wish to continue? type 'yes' to continue... "
+read -r ans
+[[ ${ans} != yes ]] && exit 0
+
+# check requirements
+! which efibootmgr 1>/dev/null 2>&1 && err "'efibootmgr' command not found"
+[[ $(whoami) == root ]] || err "root permission required!"
+
+# remove old efi executables and copy the new kernel
+efiexec="vmlinuz-${KVER}.efi"  # efi executable name eg. vmlinuz-5.15.72-gentoo.efi
+printf "copying kernel image to efi directory... "
+rm -f "${efimntpnt}"/"${efiexec}"
+cp "${kimage}" "${efimntpnt}"/"${efiexec}"
+info "done"
+
+# copy microcode and initramfs to esp if esp is not mounted at /boot
+if [[ ${efimntpnt} != /boot ]]; then
+  if [[ ${IS_MICROCODE} == yes ]]; then
+    log "copying microcode to efi directory... "
+    rm -f "${efimntpnt}"/"${MICROCODE}"
+    cp /boot/"${MICROCODE}" "${efimntpnt}"/"${MICROCODE}"
+    info "done"
+  fi
+
+  if [[ ${IS_INITRAMFS} == yes ]]; then
+    log "copying initramfs to efi directory... "
+    rm -f "${efimntpnt}"/initramfs-"${KVER}".img
+    cp /boot/initramfs-"${KVER}".img "${efimntpnt}"/initramfs-"${KVER}".img
+    info "done"
+  fi
+fi
+
+log "creating boot entry using efibootmgr... "
+efibootmgr --quiet --create \
+           --disk "${EFI_DRIVE}" --part "${ESP_PARTN}" \
+           --label "${LABEL}" \
+           --loader "\\${efiexec}" \
+           --unicode "root=PARTUUID=${root_partuuid} rootfstype=${root_fstype} rootflags=${root_flags} rw ${DEFAULT_KERNEL_PARAMS} ${KPARAMS} ${INITRD}" \
+           >/dev/null 2>&1
+
+if [[ "$?" -gt 0 ]]; then # yeah shellcheck has something to spit out every time
+  err "failed to create boot entry"
+else
+  info "success"
+fi
+log
+
+ans=
+log
+warn "Do you wish to remove old duplicate boot entries? type 'yes' to continue... "
+read -r ans
+[[ ${ans} != yes ]] && exit 0
+
+# get boot idx of the newly created boot entry. this should
+# be the first entry in bootorder since efibootmgr adds any
+# new entry at first position(0) unless specified
+printf "removing duplicate boot entries... "
+boot_idx=$(efibootmgr | grep BootOrder | awk -F ',' '{print $1}' | tr -d "[:alpha:]: ")
+for i in $(efibootmgr | grep -iw "${LABEL}" | awk -F "*" '{print $1}' | sed 's/Boot//'); do
+  if [[ ${i} != "${boot_idx}" ]]; then
+    efibootmgr --quiet -b "${i}" -B || err "failed to remove boot entry ${i}"
+  fi
+done
+info "done"
+
+log
+info "run 'efibootmgr' to see current boot entries"
+echo
+exit 0
+# vim: set nospell:
